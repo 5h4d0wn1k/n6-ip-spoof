@@ -1,75 +1,86 @@
-# N6 — IP Spoofing Tool
+# N6 — IP Spoof (offline checksum engine + gated live send)
 
-Craft packets with spoofed source IP addresses, SYN flood simulation, and IPID prediction.
+Crafts IP packets with spoofed source addresses. The checksum engine computes
+correct IPv4 header, TCP (pseudo-header) and UDP checksums; sending those
+packets requires `--live` (root, raw sockets). `--show` prints the packet
+bytes without sending. An offline `--harness` verifies all checksum paths
+against four independent reference vectors.
 
 ## Overview
 
-This project implements an IP spoofing research tool that:
-- Crafts raw IP/TCP/UDP/ICMP packets with spoofed source addresses
-- Simulates SYN flood attacks for testing SYN cookie defenses
-- Predicts IPID sequences to assess host predictability
-- Generates random source IPs for obfuscation testing
-- Provides interactive and CLI modes
+**Components:**
+- `IPSpoofer.checksum` — standard RFC 1071 ones-complement.
+- `IPSpoofer.transport_checksum` — pseudo-header + TCP/UDP header checksum.
+- `IPSpoofer.craft_raw_packet` — builds a full IP frame (header + transport
+  header with correct checksums) for TCP, UDP, or ICMP.
+- `--harness` — offline self-check against known hex vectors; runs unprivileged.
+- `--show` / `--dry-run` — build and print the packet hex, no socket created.
+- `--live` — required for any actual send; pin to interface with `--iface`
+  (`SO_BINDTODEVICE`).
 
-## Features
+## What Works
 
-- **Packet crafting**: Build raw IP packets with arbitrary headers
-- **SYN flood simulation**: Test SYN flood defenses in controlled environments
-- **IPID prediction**: Analyze IP identification sequence predictability
-- **Protocol support**: TCP, UDP, and ICMP packet generation
-- **Random IP generation**: Create random source addresses by class
-
-## Installation
-
-No external dependencies — uses only the Python standard library.
-
-```bash
-# No pip install needed
-```
+- IP header checksum (RFC 1071 reference vector: `0xB861`).
+- TCP checksum with and without payload (`0x0FED`, `0xAF50`).
+- UDP checksum (`0x638A`).
+- Self-consistent crafted packets (re-derived checksums match in-packet fields).
+- SYN flood and IPID prediction modes gated behind `--live`.
 
 ## Usage
 
 ```bash
-# Interactive mode
-sudo python3 ip_spoof.py --interactive
+# Offline harness (default — no privileges)
+python3 ip_spoof.py --harness
 
-# Send spoofed SYN packet
-sudo python3 ip_spoof.py --src 10.0.0.1 --dst 192.168.1.1 --dport 80
+# Build and display a TCP SYN packet (no send)
+python3 ip_spoof.py --show --src 192.0.2.1 --dst 192.0.2.2 --protocol TCP
 
-# SYN flood simulation (requires root)
-sudo python3 ip_spoof.py --syn-flood --dst 192.168.1.1 --count 100
+# Live send (root)
+sudo python3 ip_spoof.py --live --src 192.0.2.1 --dst 192.0.2.2 \
+    --protocol TCP --count 10 --iface eth0
 
-# IPID prediction
-sudo python3 ip_spoof.py --ipid-predict --target 192.168.1.1
+# SYN flood test (root, bounded count)
+sudo python3 ip_spoof.py --live --syn-flood --dst 192.0.2.2 --count 50
 
-# Generate random IP
+# Random IP (no privileges)
 python3 ip_spoof.py --random-ip
 ```
 
-## Example Output
+## Tests
 
+```bash
+python3 -m unittest discover -s tests
 ```
-╔═══════════════════════════════════════╗
-║     N6 — IP Spoofing Tool            ║
-║  Craft packets with spoofed IPs      ║
-╚═══════════════════════════════════════╝
 
---- Menu ---
-1. Send spoofed packet
-2. SYN flood simulation
-3. IPID prediction
-4. Generate random IP
-5. Craft raw packet (inspect)
-6. Stats
-0. Exit
+## Live Lab Test Plan
 
-> 5
-Source IP: 10.0.0.99
-Dest IP: 192.168.1.1
-Protocol (TCP/UDP/ICMP) [TCP]:
-  Packet (54 bytes):
-  Hex: 45000036...
-```
+> Authorized own-lab use only. Use documented placeholders (192.0.2.x, 198.51.100.x).
+
+1. Run `--harness` and confirm all reference vectors pass.
+2. Build a SYN packet with `--show`, paste the hex into Wireshark and confirm
+   all fields (IP checksum, TCP checksum, payload) decode correctly.
+3. On a lab target with TCP SYN cookies enabled, run
+   `sudo python3 ip_spoof.py --live --src 192.0.2.1 --dst 192.0.2.2 --count 5`
+   and confirm the target responds with SYN-ACK to the spoofed address.
+4. Capture with `tcpdump -i <iface> -nn` during a bounded SYN flood
+   (`--count 20`) and confirm spoofed source addresses appear.
+
+## Metrics
+
+Core offline checksum engine is deterministic and tested against four
+hard-coded hex vectors:
+
+- IP header checksum 0xB861: PASS
+- TCP checksum (no payload) 0x0FED: PASS
+- TCP checksum (with payload) 0xAF50: PASS
+- UDP checksum 0x638A: PASS
+- Crafted TCP/UDP packets self-consistent (re-derived checksums): PASS (5 tests)
+- Header field correctness (sport, dport, doff, flags, length): PASS (2 tests)
+- Random IP format: PASS (2 tests)
+- `--harness` subprocess exit 0: PASS
+- Gate (`--live` required for send): PASS
+- `--show` prints hex: PASS
+- Exit code: `0` on harness, `1` on gate refusal
 
 ## Legal Disclaimer
 

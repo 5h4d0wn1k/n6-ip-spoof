@@ -72,6 +72,20 @@ class IPSpoofer:
                              ident, frag_off, ttl, proto, c, src, dst)
         return header
 
+    def _pseudo_header(self, src_ip, dst_ip, protocol, length):
+        """IPv4 transport pseudo-header for TCP/UDP checksums."""
+        return (socket.inet_aton(src_ip) + socket.inet_aton(dst_ip)
+                + struct.pack('!BBH', 0, protocol, length))
+
+    def transport_checksum(self, src_ip, dst_ip, protocol, header, payload=b''):
+        """16-bit TCP/UDP checksum incl. the pseudo-header.
+
+        `header` must have its checksum field set to zero.
+        """
+        length = len(header) + len(payload)
+        return self.checksum(self._pseudo_header(src_ip, dst_ip, protocol,
+                                                 length) + header + payload)
+
     def build_tcp_header(self, src_port, dst_port, flags, seq_num, ack_num):
         """Build raw TCP header."""
         data_offset = 5
@@ -99,19 +113,30 @@ class IPSpoofer:
         return struct.pack('!HHHH', src_port, dst_port, length, 0)
 
     def craft_raw_packet(self, src_ip, dst_ip, src_port, dst_port,
-                         protocol='TCP', flags=None, payload=b''):
+                         protocol='TCP', flags=None, payload=b'',
+                         seq_num=0, ack_num=0):
         """Craft a complete IP packet with spoofed source address."""
         if flags is None:
             flags = ['SYN']
 
         if protocol.upper() == 'TCP':
-            tcp_hdr = self.build_tcp_header(src_port, dst_port, flags, 0, 0)
+            tcp_hdr = bytearray(self.build_tcp_header(src_port, dst_port,
+                                                      flags, seq_num, ack_num))
+            ck = self.transport_checksum(src_ip, dst_ip, 6,
+                                         bytes(tcp_hdr), payload)
+            tcp_hdr[16:18] = struct.pack('!H', ck)
+            tcp_hdr = bytes(tcp_hdr)
             ip_hdr = self.build_ip_header(src_ip, dst_ip, 6,
                                            len(tcp_hdr) + len(payload))
             return ip_hdr + tcp_hdr + payload
 
         elif protocol.upper() == 'UDP':
-            udp_hdr = self.build_udp_header(src_port, dst_port, len(payload))
+            udp_hdr = bytearray(self.build_udp_header(src_port, dst_port,
+                                                      len(payload)))
+            ck = self.transport_checksum(src_ip, dst_ip, 17,
+                                         bytes(udp_hdr), payload)
+            udp_hdr[6:8] = struct.pack('!H', ck)
+            udp_hdr = bytes(udp_hdr)
             ip_hdr = self.build_ip_header(src_ip, dst_ip, 17,
                                            len(udp_hdr) + len(payload))
             return ip_hdr + udp_hdr + payload
@@ -133,8 +158,8 @@ class IPSpoofer:
         return None
 
     def send_spoofed(self, src_ip, dst_ip, dst_port=80, protocol='TCP',
-                     flags=None, count=1, delay=0.1):
-        """Send spoofed packets using raw socket."""
+                     flags=None, count=1, delay=0.1, iface=None):
+        """Send spoofed packets using raw socket (--live)."""
         if flags is None:
             flags = ['SYN']
 
@@ -157,6 +182,11 @@ class IPSpoofer:
                 return
 
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            if iface:
+                # Pin the socket to a specific interface device.
+                sock.setsockopt(socket.SOL_SOCKET, 25,  # SO_BINDTODEVICE
+                                iface.encode() + b'\x00')
+                print(f"    Bound to interface: {iface}")
 
             for i in range(count):
                 src_port = random.randint(1024, 65535)
@@ -387,19 +417,110 @@ def interactive_mode():
             break
 
 
+def run_harness():
+    """Offline checksum verification against known vectors.
+
+    The IP vector is the classic IPv4 header example from networking texts;
+    the TCP/UDP vectors are computed from the documented pseudo-header
+    algorithm. All run with no privileges and no sockets.
+    """
+    import struct
+    spoofer = IPSpoofer()
+    ok = True
+
+    def verify(label, cond, detail=''):
+        nonlocal ok
+        print(f'  [{"PASS" if cond else "FAIL"}] {label} {detail}')
+        ok = ok and cond
+
+    print('=== N6 IP Spoof: offline checksum verification ===')
+
+    # 1. Classic IPv4 header checksum vector -> 0xB861
+    ip_hdr = bytes.fromhex(
+        '450000730000400040110000c0a80001c0a800c7')
+    ip_ck = spoofer.checksum(ip_hdr)
+    verify('IP header checksum == 0xB861', ip_ck == 0xB861,
+           f'{ip_ck:04x}')
+
+    # 2. TCP checksum via pseudo-header (fixed SYN segment) -> 0x0FED
+    tcp = bytes.fromhex(
+        '04d2' '0050' '00000000' '00000000' '5002' '16d0' '0000' '0000')
+    tcp_ck = spoofer.transport_checksum('192.0.2.1', '192.0.2.2', 6, tcp)
+    verify('TCP checksum (no payload) == 0x0FED',
+           tcp_ck == 0x0FED, f'{tcp_ck:04x}')
+
+    # 3. TCP checksum with payload -> 0xAF50  (flags byte 0x02 = SYN)
+    tcp2 = bytes.fromhex(
+        'c000' '01bb' '00000001' '00000000' '5002' '2000' '0000' '0000')
+    tcp2_ck = spoofer.transport_checksum('198.51.100.1', '198.51.100.2', 6,
+                                         tcp2, b'GET /')
+    verify('TCP checksum (with payload) == 0xAF50',
+           tcp2_ck == 0xAF50, f'{tcp2_ck:04x}')
+
+    # 4. UDP checksum via pseudo-header -> 0x638A
+    udp = bytes.fromhex('0035' '3039' '000c' '0000')
+    udp_ck = spoofer.transport_checksum('192.0.2.1', '192.0.2.2', 17,
+                                        udp, b'test')
+    verify('UDP checksum == 0x638A', udp_ck == 0x638A, f'{udp_ck:04x}')
+
+    # 5. Full crafted TCP packet: parse back and re-derive checksums
+    pkt = spoofer.craft_raw_packet('192.0.2.1', '192.0.2.2', 49152, 443,
+                                   protocol='TCP', flags=['SYN', 'ACK'],
+                                   payload=b'GET /')
+    ip_fields = struct.unpack('!BBHHHBBH4s4s', pkt[:20])
+    stored_ip_ck = ip_fields[7]
+    zeroed = pkt[:10] + b'\x00\x00' + pkt[12:20]
+    verify('crafted IP header checksum valid',
+           spoofer.checksum(zeroed) == stored_ip_ck,
+           f'{stored_ip_ck:04x}')
+    tcp_from_pkt = pkt[20:40]
+    stored_tcp_ck = struct.unpack('!H', tcp_from_pkt[16:18])[0]
+    zeroed_tcp = tcp_from_pkt[:16] + b'\x00\x00' + tcp_from_pkt[18:]
+    verify('crafted TCP checksum valid (pseudo-header + payload)',
+           spoofer.transport_checksum('192.0.2.1', '192.0.2.2', 6,
+                                      zeroed_tcp, b'GET /') == stored_tcp_ck,
+           f'{stored_tcp_ck:04x}')
+    verify('crafted IP total length correct',
+           ip_fields[2] == len(pkt), f'{ip_fields[2]} vs {len(pkt)}')
+
+    # 6. Crafted UDP packet
+    upkt = spoofer.craft_raw_packet('192.0.2.1', '192.0.2.2', 53, 12345,
+                                    protocol='UDP', payload=b'test')
+    udp_from = upkt[20:28]
+    stored_udp_ck = struct.unpack('!H', udp_from[6:8])[0]
+    zeroed_udp = udp_from[:6] + b'\x00\x00'
+    verify('crafted UDP checksum valid',
+           spoofer.transport_checksum('192.0.2.1', '192.0.2.2', 17,
+                                      zeroed_udp, b'test') == stored_udp_ck,
+           f'{stored_udp_ck:04x}')
+
+    print('\n[RESULT] ' + ('PASS' if ok else 'FAIL'))
+    return 0 if ok else 1
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='N6 — IP Spoofing Tool',
+        description='N6 — IP Spoofing Tool (offline checksum engine + '
+                    '--live raw send)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --src 10.0.0.1 --dst 192.168.1.1 --dport 80
-  %(prog)s --syn-flood --dst 192.168.1.1 --count 100
-  %(prog)s --ipid-predict --target 192.168.1.1
-  %(prog)s --interactive
+  %(prog)s                  # offline checksum harness (default)
+  %(prog)s --harness        # same
+  %(prog)s --show --src 192.0.2.1 --dst 192.0.2.2   # print packet bytes
+  %(prog)s --live --src 192.0.2.1 --dst 192.0.2.2 --iface eth0  # send
+  %(prog)s -i               # interactive
         """)
     parser.add_argument('--interactive', '-i', action='store_true',
                         help='Interactive mode')
+    parser.add_argument('--harness', action='store_true',
+                        help='Run offline checksum harness (default)')
+    parser.add_argument('--show', '--dry-run', action='store_true',
+                        dest='show',
+                        help='Build and print the packet without sending')
+    parser.add_argument('--live', action='store_true',
+                        help='Actually send on a raw socket (root)')
+    parser.add_argument('--iface', help='Interface for SO_BINDTODEVICE')
     parser.add_argument('--src', help='Source IP (spoofed)')
     parser.add_argument('--dst', help='Destination IP')
     parser.add_argument('--dport', type=int, default=80,
@@ -410,9 +531,9 @@ Examples:
     parser.add_argument('--count', type=int, default=1,
                         help='Number of packets')
     parser.add_argument('--syn-flood', action='store_true',
-                        help='SYN flood simulation mode')
+                        help='SYN flood simulation mode (--live)')
     parser.add_argument('--ipid-predict', action='store_true',
-                        help='IPID prediction mode')
+                        help='IPID prediction mode (--live)')
     parser.add_argument('--target', help='Target for IPID prediction')
     parser.add_argument('--ipid-samples', type=int, default=20,
                         help='IPID prediction samples')
@@ -422,35 +543,59 @@ Examples:
     args = parser.parse_args()
     spoofer = IPSpoofer()
 
-    if args.interactive or len(sys.argv) == 1:
+    if args.harness or not any([args.src, args.dst, args.syn_flood,
+                                args.ipid_predict, args.random_ip,
+                                args.interactive]):
+        sys.exit(run_harness())
+
+    if args.interactive:
         interactive_mode()
-        return
+        return 0
 
     if args.random_ip:
         print(f"Random IP: {spoofer.generate_random_ip()}")
-        return
+        return 0
 
     if args.ipid_predict:
         if not args.target:
             print("[-] --target required for IPID prediction")
-            sys.exit(1)
+            return 1
+        if not args.live:
+            print("[-] IPID prediction needs a raw socket; rerun with --live "
+                  "(root). Use --harness for offline work.")
+            return 1
         spoofer.predict_ipid(args.target, args.ipid_samples)
-        return
+        return 0
 
     if args.syn_flood:
         if not args.dst:
             print("[-] --dst required for SYN flood")
-            sys.exit(1)
+            return 1
+        if not args.live:
+            print("[-] SYN flood sends raw packets; rerun with --live (root).")
+            return 1
         spoofer.syn_flood_simulation(args.dst, args.dport, args.count)
-        return
+        return 0
 
     if args.src and args.dst:
+        if args.show:
+            packet = spoofer.craft_raw_packet(
+                args.src, args.dst, 12345, args.dport, args.protocol)
+            print(f"[+] Packet ({len(packet)} bytes), not sent (--dry-run):")
+            print(f"    Hex: {packet.hex()}")
+            print(f"    First 40 bytes: {packet[:40].hex(' ')}")
+            return 0
+        if not args.live:
+            print("[-] Sending requires a raw socket; rerun with --live "
+                  "(root), or use --show to inspect the crafted bytes.")
+            return 1
         spoofer.send_spoofed(args.src, args.dst, args.dport, args.protocol,
-                             count=args.count)
-    else:
-        print("[-] --src and --dst required, or use --interactive")
-        sys.exit(1)
+                             count=args.count, iface=args.iface)
+        return 0
+
+    print("[-] --src and --dst required, or use --interactive")
+    return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
