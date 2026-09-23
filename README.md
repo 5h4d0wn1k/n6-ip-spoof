@@ -3,52 +3,47 @@
 > or hold explicit written authorization to assess**. Unauthorized use is
 > prohibited and may be illegal. Read [ETHICS.md](ETHICS.md) and
 > [SCOPE.md](SCOPE.md) before use. Use at your own risk; **AS IS**, no warranty.
-# N6 — IP Spoof (offline checksum engine + gated live send)
 
-Crafts IP packets with spoofed source addresses. The checksum engine computes
-correct IPv4 header, TCP (pseudo-header) and UDP checksums; sending those
-packets requires `--live` (root, raw sockets). `--show` prints the packet
-bytes without sending. An offline `--harness` verifies all checksum paths
-against four independent reference vectors.
+# N6 — IP Spoofing Toolkit
 
-## Overview
+IP packet-crafting toolkit for network security testing: builds raw IPv4 frames with forged source addresses, computes RFC 1071 IP/TCP/UDP checksums, and — only behind an explicit `--live` gate — sends them over raw sockets for authorized lab use.
 
-**Components:**
-- `IPSpoofer.checksum` — standard RFC 1071 ones-complement.
-- `IPSpoofer.transport_checksum` — pseudo-header + TCP/UDP header checksum.
-- `IPSpoofer.craft_raw_packet` — builds a full IP frame (header + transport
-  header with correct checksums) for TCP, UDP, or ICMP.
-- `--harness` — offline self-check against known hex vectors; runs unprivileged.
-- `--show` / `--dry-run` — build and print the packet hex, no socket created.
-- `--live` — required for any actual send; pin to interface with `--iface`
-  (`SO_BINDTODEVICE`).
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/5h4d0wn1k/n6-ip-spoof.svg)](https://github.com/5h4d0wn1k/n6-ip-spoof)
+[![Last commit](https://img.shields.io/github/last-commit/5h4d0wn1k/n6-ip-spoof.svg)](https://github.com/5h4d0wn1k/n6-ip-spoof)
+[![Issues](https://img.shields.io/github/issues/5h4d0wn1k/n6-ip-spoof.svg)](https://github.com/5h4d0wn1k/n6-ip-spoof)
 
-## What Works
+## Why
 
-- IP header checksum (RFC 1071 reference vector: `0xB861`).
-- TCP checksum with and without payload (`0x0FED`, `0xAF50`).
-- UDP checksum (`0x638A`).
-- Self-consistent crafted packets (re-derived checksums match in-packet fields).
-- SYN flood and IPID prediction modes gated behind `--live`.
+Offline-first packet crafting is the safest way to learn IP spoofing mechanics — checksum math, header layout, TCP/UDP pseudo-headers, and raw sockets — without touching real systems. Every path that *can* be verified offline *is*: the checksum engine is benchmarked against four fixed reference hex vectors, and actual network egress is locked behind `--live` plus root privileges so mistakes are hard. Use it only against networks you own or hold express written authorization to test.
 
-## Usage
+## Features
+
+- **RFC 1071 ones-complement checksum engine** for IPv4, TCP pseudo-header and UDP, verified against fixed vectors (`0xB861`, `0x0FED`, `0xAF50`, `0x638A`)
+- **Raw IPv4 frame builder** — IP header plus TCP / UDP / ICMP transport header in one pass
+- **`--harness` offline self-test** — 15 unittest assertions, runs unprivileged, exit `0`
+- **`--show` / `--dry-run`** — builds and prints packet bytes without creating a socket
+- **`--live` gated send** — raw sockets, `--iface` (`SO_BINDTODEVICE`) binding required
+- **Bounded `--syn-flood` and `--ipid-predict` modes** for lab traffic analysis
+- **`--random-ip` generation** — safe to run with no privileges
+
+## Quickstart
 
 ```bash
-# Offline harness (default — no privileges)
-python3 ip_spoof.py --harness
+git clone https://github.com/5h4d0wn1k/n6-ip-spoof.git && cd n6-ip-spoof
 
-# Build and display a TCP SYN packet (no send)
-python3 ip_spoof.py --show --src 192.0.2.1 --dst 192.0.2.2 --protocol TCP
+# Offline checksum self-test (no privileges)
+python3 firmware/ip_spoof.py --harness
 
-# Live send (root)
-sudo python3 ip_spoof.py --live --src 192.0.2.1 --dst 192.0.2.2 \
+# Build and print a TCP SYN packet without sending
+python3 firmware/ip_spoof.py --show --src 192.0.2.1 --dst 192.0.2.2 --protocol TCP
+
+# Live send (root, authorized lab network only)
+sudo python3 firmware/ip_spoof.py --live --src 192.0.2.1 --dst 192.0.2.2 \
     --protocol TCP --count 10 --iface eth0
 
-# SYN flood test (root, bounded count)
-sudo python3 ip_spoof.py --live --syn-flood --dst 192.0.2.2 --count 50
-
-# Random IP (no privileges)
-python3 ip_spoof.py --random-ip
+# Random IP generator (unprivileged)
+python3 firmware/ip_spoof.py --random-ip
 ```
 
 ## Tests
@@ -57,74 +52,24 @@ python3 ip_spoof.py --random-ip
 python3 -m unittest discover -s tests
 ```
 
-## Live Lab Test Plan
+## Project structure
 
-> Authorized own-lab use only. Use documented placeholders (192.0.2.x, 198.51.100.x).
+- `firmware/ip_spoof.py` — packet-crafting engine and CLI
+- `tests/` — 15 unit tests including checksum reference vectors
+- `ETHICS.md` / `SCOPE.md` / `SECURITY.md` — authorized-use and reporting rules
 
-1. Run `--harness` and confirm all reference vectors pass.
-2. Build a SYN packet with `--show`, paste the hex into Wireshark and confirm
-   all fields (IP checksum, TCP checksum, payload) decode correctly.
-3. On a lab target with TCP SYN cookies enabled, run
-   `sudo python3 ip_spoof.py --live --src 192.0.2.1 --dst 192.0.2.2 --count 5`
-   and confirm the target responds with SYN-ACK to the spoofed address.
-4. Capture with `tcpdump -i <iface> -nn` during a bounded SYN flood
-   (`--count 20`) and confirm spoofed source addresses appear.
+## Documentation
 
-## Metrics
+- [ETHICS.md](ETHICS.md) — educational purpose and authorized use only
+- [SCOPE.md](SCOPE.md) — authorized-testing scope checklist
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute safely
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community standards
 
-Core offline checksum engine is deterministic and tested against four
-hard-coded hex vectors:
+## Contributing
 
-- IP header checksum 0xB861: PASS
-- TCP checksum (no payload) 0x0FED: PASS
-- TCP checksum (with payload) 0xAF50: PASS
-- UDP checksum 0x638A: PASS
-- Crafted TCP/UDP packets self-consistent (re-derived checksums): PASS (5 tests)
-- Header field correctness (sport, dport, doff, flags, length): PASS (2 tests)
-- Random IP format: PASS (2 tests)
-- `--harness` subprocess exit 0: PASS
-- Gate (`--live` required for send): PASS
-- `--show` prints hex: PASS
-- Exit code: `0` on harness, `1` on gate refusal
-
-## Legal Disclaimer
-
-**IMPORTANT: Read before use.**
-
-This project is provided for **educational and authorized security testing purposes only**.
-
-### Authorization Requirements
-- You MUST have explicit written permission from the network owner before using this tool
-- Unauthorized interception of network communications is illegal under federal and state laws
-- This tool should ONLY be used on networks you own or have written authorization to test
-
-### Legal Framework
-- **Computer Fraud and Abuse Act (CFAA)**: Unauthorized access to computer systems is a federal crime
-- **Wiretap Act (18 U.S.C. § 2511)**: Interception of electronic communications without consent is illegal
-- **State Laws**: Many states have additional computer crime and wiretapping statutes
-- **GDPR/CCPA**: Data collection may be subject to privacy regulations
-
-### Acceptable Use
-- Testing security of your own networks
-- Authorized penetration testing with written scope
-- Academic research in controlled lab environments
-- Security education and training
-
-### Prohibited Use
-- Intercepting communications on networks you do not own
-- Attacking infrastructure without authorization
-- Any activity that violates applicable laws or regulations
-- Commercial use without proper licensing
-
-### No Warranty
-This software is provided "AS IS" without warranty of any kind. The author is not responsible for any misuse or damage caused by this software.
-
-### Responsible Disclosure
-If you discover vulnerabilities using this tool, follow responsible disclosure practices:
-1. Report to the vendor/owner privately
-2. Allow reasonable time for remediation
-3. Do not exploit beyond proof of concept
+Contributions that strengthen the checksum engine, fixtures, or defensive lab guidance are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md); all contributions must stay educational and abuse-resistant.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). Provided **AS IS**, without warranty, for education and authorized testing only.
